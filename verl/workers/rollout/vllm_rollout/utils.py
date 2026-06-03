@@ -27,6 +27,50 @@ from vllm.outputs import RequestOutput
 from verl.utils.device import is_npu_available
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+
+
+# TODO: Wire up at the call site when flashinfer_trtllm backend is supported.
+# Currently unused because we force the triton backend (VLLM_USE_FLASHINFER_MOE_FP16=0).
+# def _reset_moe_weights_to_standard_layout(model):
+#     """Reset MoE weight params from block layout (4D) back to standard 3D.
+#
+#     After ``process_weights_after_loading``, vLLM's FlashInfer TRTLLM backend
+#     converts ``w13_weight`` and ``w2_weight`` to a 4D block layout.  The
+#     ``weight_loader`` callback indexes ``param.data[expert_id]`` and expects a
+#     2D slice, so it fails on 4D tensors.  This resets them to standard 3D so
+#     weight_loader works, then process_weights_after_loading re-applies the
+#     block layout after loading.
+#
+#     No-op for backends (e.g. triton) where weights are already 3D.
+#     """
+#     from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+#
+#     inner = getattr(model, "model", None) or getattr(model, "language_model", None)
+#     if inner is None:
+#         return
+#     if hasattr(inner, "layers") is False and hasattr(inner, "model"):
+#         inner = inner.model
+#
+#     for module in inner.modules():
+#         if not isinstance(module, FusedMoE):
+#             continue
+#         for pname in ("w13_weight", "w2_weight"):
+#             param = getattr(module, pname, None)
+#             if param is None or param.data.ndim <= 3:
+#                 continue
+#             E = param.data.shape[0]
+#             if pname == "w13_weight":
+#                 orig_shape = (E, module.intermediate_size_per_partition * 2, module.hidden_size)
+#             else:
+#                 orig_shape = (E, module.hidden_size, module.intermediate_size_per_partition)
+#             dev, dt = param.device, param.dtype
+#             param.data = torch.empty(0)
+#             torch.cuda.empty_cache()
+#             param.data = torch.zeros(orig_shape, dtype=dt, device=dev)
+#             if hasattr(param, "is_shuffled"):
+#                 param.is_shuffled = False
+
+
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches, is_fp8_model, load_quanted_weights
 
 logger = logging.getLogger(__file__)

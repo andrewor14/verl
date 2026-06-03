@@ -138,8 +138,13 @@ class TorchTitanEngine(BaseEngine):
             context_parallel_degree=self.engine_config.context_parallel_size,
             expert_parallel_degree=self.engine_config.expert_parallel_size,
         )
+        # interval=1 ensures torchtitan saves whenever verl requests it.
+        # verl controls save frequency via trainer.save_freq; torchtitan's
+        # interval is a second gate that would silently skip saves if set
+        # higher (default 500).
         checkpoint = CheckpointManager.Config(
             enable=True,
+            interval=1,
             initial_load_in_hf=True,
             initial_load_model_only=True,
             initial_load_path=model_config.path,
@@ -438,6 +443,20 @@ class TorchTitanEngine(BaseEngine):
             for module in self.module:
                 load_fsdp_model_to_gpu(module)
 
+            # Refresh ModelWrapper's cached state dict. CPU offload cycles
+            # (model.cpu() / model.to(device)) create new tensors, breaking
+            # the references cached at init time. Without this refresh,
+            # save() writes the original pretrained weights instead of the
+            # trained ones. Only needed when offloading is enabled.
+            from torchtitan.components.checkpoint import MODEL
+            from torch.distributed.checkpoint.state_dict import get_model_state_dict
+            if MODEL in self.checkpointer.states:
+                self.checkpointer.states[MODEL].cache_state_dict = {
+                    k: v
+                    for m in self.module
+                    for k, v in get_model_state_dict(m).items()
+                }
+
         # Override TorchTitan's folder to use verl's path
         parent_dir = os.path.dirname(local_path)
         self.checkpointer.folder = parent_dir
@@ -495,6 +514,23 @@ class TorchTitanEngine(BaseEngine):
             for module in self.module:
                 offload_fsdp_model_to_cpu(module)
 
+        device = get_device_id()  # used when fsdp2 set cpu_offload_policy
+
+        # Reconstruct full tensors from FSDP shards before key conversion.
+        # With EP=1, FSDP shards grouped expert weights [E, F, D] on dim 0,
+        # so to_hf() only sees the local shard and produces E/world_size
+        # expert keys instead of all E. By calling full_tensor() first,
+        # to_hf() gets the complete tensor and correctly splits all E experts.
+        # With EP>1, skip this — iter_per_tensor_params_ep handles gathering.
+        if not self.parallel_dims.ep_enabled:
+            full_params = {}
+            for name, param in params.items():
+                if isinstance(param, DTensor):
+                    full_params[name] = param.to(device, non_blocking=True).full_tensor().cpu()
+                else:
+                    full_params[name] = param.cpu() if param.is_cuda else param
+            params = full_params
+
         # Convert TorchTitan key names to HuggingFace key names (expected by vLLM)
         sd_adapter = self.checkpointer.sd_adapter
         if sd_adapter is not None:
@@ -507,8 +543,6 @@ class TorchTitanEngine(BaseEngine):
         if "model.embed_tokens.weight" in params and "lm_head.weight" not in params:
             params["lm_head.weight"] = params["model.embed_tokens.weight"]
 
-        device = get_device_id()  # used when fsdp2 set cpu_offload_policy
-
         # When Expert Parallel (EP) is used, sd_adapter.to_hf() only produces
         # individual expert weights for the locally-owned experts (e.g., 16 out of
         # 128 with EP=8). vLLM needs ALL experts. We gather the missing experts
@@ -519,13 +553,10 @@ class TorchTitanEngine(BaseEngine):
             ep_size = self.parallel_dims.ep
             per_tensor_param = iter_per_tensor_params_ep(params, device, ep_group, ep_size)
         else:
-            # TODO: cast fp32 to bf16 to reduce weight sync overhead, need more fine-grained control, e.g MoE gate
             per_tensor_param = (
                 (
                     name,
-                    param.to(device, non_blocking=True).full_tensor().to(torch.bfloat16, non_blocking=True)
-                    if isinstance(param, DTensor)
-                    else param,
+                    param.to(torch.bfloat16) if param.dtype != torch.bfloat16 else param,
                 )
                 for name, param in params.items()
             )
