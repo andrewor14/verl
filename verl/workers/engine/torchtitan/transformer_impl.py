@@ -150,6 +150,14 @@ class TorchTitanEngine(BaseEngine):
             initial_load_path=model_config.path,
         )
         compile_config = CompileConfig(enable=self.engine_config.use_torch_compile)
+
+        # Resolve post_model_init_fn from dotted string path (e.g. QAT transform)
+        post_model_init_fn = None
+        if self.engine_config.post_model_init_fn is not None:
+            import importlib as _il
+            module_path, fn_name = self.engine_config.post_model_init_fn.rsplit(".", 1)
+            post_model_init_fn = getattr(_il.import_module(module_path), fn_name)
+
         training_kwargs = {}
         if self.engine_config.max_seq_len is not None:
             training_kwargs["seq_len"] = self.engine_config.max_seq_len
@@ -168,6 +176,7 @@ class TorchTitanEngine(BaseEngine):
             checkpoint=checkpoint,
             compile=compile_config,
             training=training,
+            post_model_init_fn=post_model_init_fn,
             # Use a no-op dataloader since verl has its own data loading
             dataloader=NoOpDataLoader.Config(),
             # Provide a concrete loss so Trainer.__init__ can build it;
@@ -242,6 +251,19 @@ class TorchTitanEngine(BaseEngine):
         self.checkpointer = self.trainer.checkpointer
         # load initial HF weights
         self.checkpointer.load()
+
+        # Verify QAT was applied if post_model_init_fn was configured
+        if self.engine_config.post_model_init_fn is not None:
+            qat_count = sum(
+                1 for m in self.module[0].modules()
+                if hasattr(m, "fake_quant_fn") and m.fake_quant_fn is not None
+            )
+            if qat_count == 0:
+                raise RuntimeError(
+                    f"post_model_init_fn={self.engine_config.post_model_init_fn} was configured "
+                    "but no modules have fake_quant_fn set. QAT was not applied."
+                )
+            logger.info(f"QAT verification: {qat_count} modules have fake_quant_fn set")
 
         if not self.engine_config.forward_only:
             self.optimizer = self.trainer.optimizers

@@ -444,6 +444,7 @@ class TorchtitanEngineConfig(EngineConfig):
     attn_type: str = "flex"
     max_seq_len: Optional[int] = None
     strategy: str = "torchtitan"
+    post_model_init_fn: Optional[str] = None
     seed: int = 42
     full_determinism: bool = False
 
