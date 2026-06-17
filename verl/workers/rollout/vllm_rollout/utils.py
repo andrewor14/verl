@@ -237,6 +237,10 @@ class vLLMColocateWorkerExtension:
             monkey_patch_compute_logits(model, vocab_size)
             # patch weight loader to support MoE model
             patch_vllm_moe_model_weight_loader(model)
+            # patch MoE layers with FP4 fake quant for QAT rollout
+            if os.environ.get("VERL_ROLLOUT_FP4_FAKE_QUANT", "0") == "1":
+                from torchao.prototype.qat.nvfp4_moe_simple import apply_fp4_fake_quant_to_vllm_moe
+                apply_fp4_fake_quant_to_vllm_moe(model)
 
     def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
         """Update the weights of the rollout model."""
@@ -302,6 +306,12 @@ class vLLMColocateWorkerExtension:
 
             for model, model_config in self._iter_all_models_with_config():
                 process_weights_after_loading(model, model_config, self.device)
+
+        if os.environ.get("VERL_ROLLOUT_FP4_FAKE_QUANT", "0") == "1":
+            from torchao.prototype.qat.nvfp4_moe_simple import fake_quantize_vllm_moe_weights_inplace
+
+            for model in self._iter_all_models():
+                fake_quantize_vllm_moe_weights_inplace(model)
 
     def _update_weights(self, weights: list[tuple[str, torch.Tensor]], peft_config: dict, base_sync_done: bool):
         if peft_config and base_sync_done:
