@@ -486,7 +486,12 @@ class TorchTitanEngine(BaseEngine):
         if max_ckpt_to_keep is not None:
             self.checkpointer.keep_latest_k = max_ckpt_to_keep
 
+        # HACK: only save model weights for now, don't save optimizer states (causes CPU OOMs)
+        from torchtitan.components.checkpoint import MODEL
+        saved_states = dict(self.checkpointer.states)
+        self.checkpointer.states = {k: v for k, v in saved_states.items() if k == MODEL}
         self.checkpointer.save(curr_step=global_step)
+        self.checkpointer.states = saved_states
 
         torch.distributed.barrier()
         if self._is_offload_param:
