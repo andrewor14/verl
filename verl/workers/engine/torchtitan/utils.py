@@ -171,12 +171,14 @@ def get_attention_masks(
     input_batch: torch.Tensor,
     positions: torch.Tensor,
     attn_type: str,
+    model: nn.Module | None = None,
 ) -> AttentionMasksType:
     match attn_type:
         case "flex":
             return _get_flex_attention_masks(
                 input_batch,
                 positions,
+                model=model,
             )
         case "varlen":
             return _create_varlen_metadata_for_document(
@@ -199,14 +201,46 @@ def _get_document_mask_mod(positions: torch.Tensor) -> _mask_mod_signature:
     return document_mask
 
 
+def _get_sliding_window_size(model: nn.Module | None) -> int | None:
+    """Extract sliding_window_size from GPT-OSS model config, if applicable."""
+    if model is None:
+        return None
+    config = getattr(model, "config", None)
+    if config is None:
+        return None
+    layers = getattr(config, "layers", None)
+    if not layers:
+        return None
+    attn_cfg = getattr(layers[0], "attention", None)
+    if attn_cfg is None:
+        return None
+    return getattr(attn_cfg, "sliding_window_size", None)
+
+
 def _get_flex_attention_masks(
     input_batch: torch.Tensor,
     positions: torch.Tensor,
+    model: nn.Module | None = None,
 ) -> AttentionMasksType:
-    mask_mods = [get_causal_mask_mod()]
+    basic_mask_mods = [get_causal_mask_mod()]
     B = input_batch.shape[0]
-    mask_mods.append(_get_document_mask_mod(positions=positions))
-    return create_attention_mask(and_masks(*mask_mods), B, None, input_batch.shape[1], input_batch.shape[1])
+    seq_len = input_batch.shape[1]
+    basic_mask_mods.append(_get_document_mask_mod(positions=positions))
+
+    sliding_window_size = _get_sliding_window_size(model)
+    if sliding_window_size is not None:
+        from torchtitan.models.common.attention import get_sliding_window_mask_mod
+
+        basic_mask = create_attention_mask(
+            and_masks(*basic_mask_mods), B, None, seq_len, seq_len,
+        )
+        sliding_window_mask = create_attention_mask(
+            and_masks(*basic_mask_mods, get_sliding_window_mask_mod(sliding_window_size)),
+            B, None, seq_len, seq_len,
+        )
+        return {"basic_mask": basic_mask, "sliding_window_mask": sliding_window_mask}
+
+    return create_attention_mask(and_masks(*basic_mask_mods), B, None, seq_len, seq_len)
 
 
 def _create_varlen_metadata_for_document(input_batch: torch.Tensor, positions: torch.Tensor) -> VarlenMetadata:

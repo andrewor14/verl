@@ -338,8 +338,9 @@ class vLLMColocateWorkerExtension:
                     load_quanted_weights(weights, self.model_runner, is_drafter=True)
             else:
                 logger.info("Loading standard weights (non-FP8, async)")
+                weights_list = list(weights)
                 for model in self._iter_all_models():
-                    model.load_weights(weights)
+                    model.load_weights(weights_list)
 
     def _get_zmq_handle(self) -> str:
         """Get ZMQ handle for communication.

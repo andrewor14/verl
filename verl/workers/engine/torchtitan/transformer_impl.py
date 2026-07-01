@@ -183,7 +183,22 @@ class TorchTitanEngine(BaseEngine):
             # verl uses its own loss function and ignores this one.
             loss=CrossEntropyLoss.Config(),
         )
-        self.trainer = Trainer(self.config)
+        # Monkey-patch parameter initialization to use fast zeros instead of
+        # expensive trunc_normal_ via DTensor. Checkpoint loading overwrites
+        # all parameters, so the initial values don't matter. Buffer init
+        # (e.g. RoPE) is unaffected.
+        from torchtitan.protocols.module import Module as _TitanModule
+
+        _orig_init_param = _TitanModule._init_param
+
+        def _fast_init_param(self_mod, name, param):
+            torch.nn.init.zeros_(param)
+
+        _TitanModule._init_param = _fast_init_param
+        try:
+            self.trainer = Trainer(self.config)
+        finally:
+            _TitanModule._init_param = _orig_init_param
 
         self._init_device_mesh()
 
@@ -553,10 +568,18 @@ class TorchTitanEngine(BaseEngine):
             full_params = {}
             for name, param in params.items():
                 if isinstance(param, DTensor):
-                    full_params[name] = param.to(device, non_blocking=True).full_tensor().cpu()
+                    full_params[name] = (
+                        param.to(device, non_blocking=True)
+                        .full_tensor()
+                        .to(torch.bfloat16)
+                        .cpu()
+                    )
                 else:
-                    full_params[name] = param.cpu() if param.is_cuda else param
+                    p = param.cpu() if param.is_cuda else param
+                    full_params[name] = p.to(torch.bfloat16) if p.is_floating_point() else p
             params = full_params
+            torch.cuda.empty_cache()
+            gc.collect()
 
         # Convert TorchTitan key names to HuggingFace key names (expected by vLLM)
         sd_adapter = self.checkpointer.sd_adapter
@@ -655,6 +678,7 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                 input_batch=input_ids,
                 positions=position_ids,
                 attn_type=attn_type,
+                model=self.trainer.model_parts[0],
             )
         else:
             loss_mask = micro_batch["loss_mask"]
